@@ -1,4 +1,4 @@
-# HDWiFiCam Pro (DGOA/DGOC WiFi Prefix) JS-Api
+# HDWiFiCam Pro (DGOA/DGOC WiFi Prefix) PY-Api
 
 Thanks to all the people in this [Home Assistant Community](https://community.home-assistant.io/t/popular-a9-mini-wi-fi-camera-the-ha-challenge/230108) thread.
 
