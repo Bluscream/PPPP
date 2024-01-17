@@ -1,4 +1,4 @@
-const KEY_TABLE = [
+KEY_TABLE = [
   0x7C, 0x9C, 0xE8, 0x4A, 0x13, 0xDE, 0xDC, 0xB2, 0x2F, 0x21, 0x23, 0xE4, 0x30, 0x7B, 0x3D, 0x8C,
   0xBC, 0x0B, 0x27, 0x0C, 0x3C, 0xF7, 0x9A, 0xE7, 0x08, 0x71, 0x96, 0x00, 0x97, 0x85, 0xEF, 0xC1,
   0x1F, 0xC4, 0xDB, 0xA1, 0xC2, 0xEB, 0xD9, 0x01, 0xFA, 0xBA, 0x3B, 0x05, 0xB8, 0x15, 0x87, 0x83,
@@ -15,63 +15,51 @@ const KEY_TABLE = [
   0x6A, 0x80, 0xDF, 0xE2, 0xBF, 0x10, 0xD7, 0x75, 0x64, 0x57, 0x76, 0xF3, 0x55, 0xCD, 0xD0, 0xC8,
   0x18, 0xE6, 0x36, 0x41, 0x62, 0xCF, 0x99, 0xF2, 0x32, 0x4C, 0x67, 0x60, 0x61, 0x92, 0xCA, 0xD3,
   0xEA, 0x63, 0x7D, 0x16, 0xB6, 0x8E, 0xD4, 0x68, 0x35, 0xC3, 0x52, 0x9D, 0x46, 0x44, 0x1E, 0x17
-];
+]
 
-const key = [0x69, 0x97, 0xcc, 0x19]
+key = [0x69, 0x97, 0xcc, 0x19]
 
-function encrypt(buf) {
-  let newbuff = []
-  previousByte = 0
-  for ([position, val] of buf.entries()) {
-    index = (key[previousByte & 0x03] + previousByte) & 0xFF
-    r = buf[position] ^ KEY_TABLE[index]
-    newbuff.push(r)
-    previousByte = r
-  }
-  return Buffer.from(newbuff)
-}
+def encrypt(buf):
+    newbuff = bytearray()
+    previous_byte = 0
+    for position, val in enumerate(buf):
+        index = (key[previous_byte & 0x03] + previous_byte) & 0xFF
+        r = val ^ KEY_TABLE[index]
+        newbuff.append(r)
+        previous_byte = r
+    return bytes(newbuff)
 
-function decrypt(buf) {
-  let newbuff = []
-  previousByte = 0
-  for ([position, val] of buf.entries()) {
-    index = (key[previousByte & 3] + previousByte) & 255
-    previousByte = buf[position]
-    r = buf[position] ^ KEY_TABLE[index]
-    newbuff.push(r)
-  }
+def decrypt(buf):
+    newbuff = bytearray()
+    previous_byte = 0
+    for position, val in enumerate(buf):
+        index = (key[previous_byte & 0x03] + previous_byte) & 0xFF
+        previous_byte = val
+        r = val ^ KEY_TABLE[index]
+        newbuff.append(r)
+    return bytes(newbuff)
 
-  return Buffer.from(newbuff)
-}
+# Example usage:
+# encrypted = encrypt(b"Hello World")
+# print(encrypted)
+# decrypted = decrypt(encrypted)
+# print(decrypted)
 
-// let b = Buffer.from("Hello World");
-// console.log(b);
-// let e = encrypt(b)
-// console.log(e)
-// console.log(decrypt(e))
-// console.log(decrypt(e).toString())
+def dh(m):
+    b = bytes.fromhex(m)
+    p = decrypt(b)
+    print(m)
+    print(p.hex())
+    print(p.decode("ascii"))
+    print("\n")
 
-function dh(m) {
-  let b = Buffer.from(m, "hex")
-  let p = decrypt(b)
-  console.log(m)
-  console.log(p.toString("hex"));
-  console.log(p.toString("ascii"));
-  console.log("\n");
-}
+def eh(m):
+    b = bytes.fromhex(m)
+    p = encrypt(b)
+    print(m)
+    print(p.hex())
+    print(p.decode("ascii"))
+    print("\n")
 
-function eh(m) {
-  let b = Buffer.from(m, "hex")
-  let p = encrypt(b)
-  console.log(m)
-  console.log(p.toString("hex"));
-  console.log(p.toString("ascii"));
-  console.log("\n");
-}
-
-module.exports = {
-  encrypt,
-  decrypt,
-  dh,
-  eh
-}
+# If you want to use this as a module, you can export the functions like this:
+# (In Python, functions are automatically available for import when the module is imported)
