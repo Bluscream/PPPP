@@ -52,10 +52,11 @@ def setup_pppp():
            speaker.write(audio_frame.frame)
 
    def video_frame(video_frame):
-       s = '--xxxxxxkkdkdkdkdkdk__BOUNDARY\r\n'
-       s += 'Content-Type: image/jpeg\r\n\r\n'
-       video_stream.write(bytes(s, 'utf-8'))
-       video_stream.write(video_frame.frame)
+       logger.debug(f'video frame')
+    #    s = '--xxxxxxkkdkdkdkdkdk__BOUNDARY\r\n'
+    #    s += 'Content-Type: image/jpeg\r\n\r\n'
+    #    video_stream.write(bytes(s, 'utf-8'))
+    #    video_stream.write(video_frame.frame)
 
    def error(err):
        logger.error(f'socket error: {err}')

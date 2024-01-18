@@ -1,50 +1,33 @@
 import socket
 import threading
-from stream import EventEmitter
-import crypt_1  # Assuming 'crypt' is a module you have for encryption
-import adpcm  # Assuming 'adpcm' is a module you have for ADPCM handling
-
-# Constants
-MCAM = 0xf1
-MDRW = 0xd1
-
-MSG_PUNCH = 0x41
-MSG_P2P_RDY = 0x42
-MSG_DRW = 0xd0
-MSG_DRW_ACK = 0xd1
-MSG_ALIVE = 0xe0
-MSG_ALIVE_ACK = 0xe1
-MSG_CLOSE = 0xf0
-
-TYPE_DICT = {
-    MSG_PUNCH: 'MSG_PUNCH',
-    MSG_P2P_RDY: 'MSG_P2P_RDY',
-    MSG_DRW: 'MSG_DRW',
-    MSG_DRW_ACK: 'MSG_DRW_ACK',
-    MSG_ALIVE: 'MSG_ALIVE',
-    MSG_ALIVE_ACK: 'MSG_ALIVE_ACK',
-    MSG_CLOSE: 'MSG_CLOSE',
-}
-
-# Commands
-CMD_SET_CYPUSH = 1
-CMD_CHECK_USER = 100
-# ... (other CMD constants)
-
-CMD_DICT = {
-    CMD_SET_CYPUSH: 'set_cypush',
-    CMD_CHECK_USER: 'check_user',
-    # ... (other CMD mappings)
-}
-
-# PTZ (Pan-Tilt-Zoom) Control Constants
-PTZ_TILT_UP_START = 0
-PTZ_TILT_UP_STOP = 1
-# ... (other PTZ constants)
+from eventemitter import EventEmitter
+import encryption  # Assuming 'crypt' is a module you have for encryption
+import adpcm # Assuming 'adpcm' is a module you have for ADPCM handling
+from .const import *
+from .enums import *
+from .types import *
+from logging import getLogger, Logger
+from argparse import Namespace
 
 class PPPP(EventEmitter):
-    def __init__(self, options):
+    logger: Logger
+    socket: socket.socket
+    IP_DEBUG_MSG: str
+    DRW_PACKET_INDEX: int
+    lastVideoFrame: int
+    videoBoundaries: set
+    videoReceived: list
+    videoOverflow: bool
+    lastAudioFrame: int
+    isConnected: bool
+    punchCount: int
+    reconnectDelay: int
+    broadcastDestination: str
+    myIpAddressToBind: str
+
+    def __init__(self, options: Namespace):
         super().__init__()
+        self.logger = getLogger(__class__.__name__)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.IP_DEBUG_MSG = None
         self.DRW_PACKET_INDEX = 0
@@ -77,139 +60,144 @@ class PPPP(EventEmitter):
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.send_broadcast()
 
+#region recieve
+
     def on_message(self, msg, rinfo):
-        pass # ... (message handling logic)
+        d = encryption.decrypt(msg)
 
+        if self.IP_DEBUG_MSG:
+            self.socket.sendto(d, (self.IP_DEBUG_MSG, 3300))
 
-        # ... (continuing from the previous Python code)
+        p: BaseMessage
+        try:
+            p = BaseMessage.from_buffer(d)
+        except Exception as e:
+            print(f"Error while parsing packet: {str(e)}")
+            return
+        try:
+            self.handle_packet(p, msg, rinfo)
+        except Exception as e:
+            print(f"Error while handling packet: {str(e)}")
+
+    def handle_packet(self, msg: BaseMessage|DRWMessage, raw, rinfo):
+        self.emit('debug', f"Received {msg}")
+
+        match(msg.type):
+            case(MessageType.PUNCH): # Reply to MSG_PUNCH to establish connection
+                print('MSG_PUNCH received')
+                if self.punchCount < 5:
+                    self.punchCount += 1
+                    self.socket.sendto(raw, (rinfo[0], rinfo[1]))
+                    self.emit('log', f"Sent {MessageType.PUNCH.name}")
+
+            case(MessageType.P2P_RDY):
+                print('MSG_P2P_RDY received')
+                self.CAM_IP = rinfo[0]
+                self.CAM_PORT = rinfo[1]
+
+                if not self.is_connected:
+                    self.is_connected = True
+                    self.reconnect_delay = 500
+                    # Use threading.Timer to mimic JavaScript's setTimeout
+                    threading.Timer(0.5, lambda: self.emit('connected', rinfo[0], rinfo[1])).start()
+
+            
+            case(MessageType.ALIVE): # Reply to MSG_ALIVE
+                print('MSG_ALIVE received')
+                self.send_simple(MessageType.ALIVE_ACK)
+                self.emit('log', f"Acknowledged {MessageType.ALIVE}")
+
+            
+            case(MessageType.CLOSE): # Reply to MSG_CLOSE
+                print('MSG_CLOSE received')
+                if self.is_connected:
+                    self.is_connected = False
+                    self.emit('disconnected', self.CAM_IP, self.CAM_PORT)
+                self.send_simple(MessageType.ALIVE_ACK, 12)
+
+            case(MessageType.DRW): # Handle MSG_DRW
+                buf = bytearray(10)
+                buf[0] = MCAM
+                buf[1] = MessageType.DRW_ACK
+                buf[2:4] = (6).to_bytes(2, 'big')
+                buf[4] = 0xd1
+                buf[5] = msg.channel
+                buf[6:8] = (1).to_bytes(2, 'big')
+                buf[8:10] = msg.index.to_bytes(2, 'big')
+                self.send_enc(buf)
+
+                match(msg.channel):
+                    case(Channel.Command): # Handle CMD Response
+                        print('CMD Response received')
+                        if msg['data'].startswith(b'\x06\x0a'):
+                            data = msg['data'][8:]
+                            _msg = data.decode('ascii')
+                            self.emit('cmd', _msg)
+
+                    case(Channel.Video): # Handle Video
+                        if msg['index'] > 65400: # Handle MSG_DRW packet index overflow
+                            self.video_overflow = True
+
+                        if self.video_overflow and msg['index'] < 65400:
+                            self.last_video_frame = -1
+                            self.video_overflow = False
+                            self.video_boundaries.clear()
+                            self.video_received = []
+
+                        if msg['data'].startswith(b'\x55\xaa\x15\xa8\x03\x00'):
+                            self.video_received[msg['index']] = msg['data'][0x20:]
+                            self.video_boundaries.add(msg['index'])
+                        else:
+                            self.video_received[msg['index']] = msg['data']
+                        self.get_video_frame()
+
+                    case(Channel.Audio): # Handle Audio
+                        if self.last_audio_frame < msg['index']:
+                            raw = msg['data'][0x20:] if msg['data'].startswith(b'\x55\xaa\x15\xa8\xaa\x01') else msg['data']
+                            decoded = adpcm.decode(raw)
+                            self.last_audio_frame = msg['index']
+                            self.emit('audio_frame', {'frame': decoded, 'packet_index': msg['index']})
+
+                    case(_):
+                        self.logger.error(f"Unknown channel: {msg.channel}")
+#endregion recieve     
+
+#region send
 
     def send_broadcast(self):
-        message = bytes.fromhex('2cba5f5d')
-        self.socket.sendto(message, (self.broadcastDestination, 32108))
-        print('broadcast Message sent.')
+        self.socket.sendto(BroadCastBytes, (self.broadcastDestination, 32108))
+        print(f'broadcast Message sent to {self.broadcastDestination}')
 
         if not self.isConnected and self.punchCount == 0:
             threading.Timer(self.reconnectDelay / 1000, self.send_broadcast).start()
             self.reconnectDelay += 1
+
+    def send_simple(self, type: MessageType, amount: int = 1):
+        buf = bytearray(4)
+        buf[0] = MCAM
+        buf[1] = type
+        buf[2:4] = (amount).to_bytes(2, 'big')
+        self.send_enc(buf)
+        self.emit('debug', f"Sent {type} x{amount}")
 
     def send_enc(self, msg):
         if isinstance(msg, bytes):
             message = msg
         else:
             message = bytes.fromhex(msg)
-        self.send(crypt_1.encrypt(message))
+        self.send(encryption.encrypt(message))
 
     def send(self, msg):
         if isinstance(msg, bytes):
             message = msg
         else:
             message = bytes.fromhex(msg)
-        self.socket.sendto(message, (self.IP_CAM, self.PORT_CAM))
+        self.socket.sendto(message, (self.CAM_IP, self.CAM_PORT))
 
         if self.IP_DEBUG_MSG:
-            self.socket.sendto(crypt_1.decrypt(message), (self.IP_DEBUG_MSG, 3301))
+            self.socket.sendto(encryption.decrypt(message), (self.IP_DEBUG_MSG, 3301))
 
-    def handle_packet(self, p, msg, rinfo):
-        logmsg = ""
-        if p['type'] == MSG_DRW:
-            logmsg = f"Received {TYPE_DICT[p['type']]} size: {p['size']} channel: {p['channel']} index: {p['index']}"
-        else:
-            logmsg = f"Received {TYPE_DICT[p['type']]} size: {p['size']}"
-        
-        self.emit('debug', logmsg)
-
-        # Reply to MSG_PUNCH to establish connection
-        if p['type'] == MSG_PUNCH:
-            print('MSG_PUNCH received')
-            if self.punch_count < 5:
-                self.punch_count += 1
-                self.socket.sendto(msg, (rinfo[0], rinfo[1]))
-                self.emit('log', f"Sent {TYPE_DICT[MSG_PUNCH]}")
-
-        if p['type'] == MSG_P2P_RDY:
-            print('MSG_P2P_RDY received')
-            self.IP_CAM = rinfo[0]
-            self.PORT_CAM = rinfo[1]
-
-            if not self.is_connected:
-                self.is_connected = True
-                self.reconnect_delay = 500
-                # Use threading.Timer to mimic JavaScript's setTimeout
-                threading.Timer(0.5, lambda: self.emit('connected', rinfo[0], rinfo[1])).start()
-
-        # Reply to MSG_ALIVE
-        if p['type'] == MSG_ALIVE:
-            print('MSG_ALIVE received')
-            buf = bytearray(4)
-            buf[0] = MCAM
-            buf[1] = MSG_ALIVE_ACK
-            buf[2:4] = (0).to_bytes(2, 'big')
-            self.send_enc(buf)
-            self.emit('log', f"Sent {TYPE_DICT[MSG_ALIVE_ACK]}")
-
-        # Reply to MSG_CLOSE
-        if p['type'] == MSG_CLOSE:
-            print('MSG_CLOSE received')
-            if self.is_connected:
-                self.is_connected = False
-                self.emit('disconnected', self.IP_CAM, self.PORT_CAM)
-            buf = bytearray(4)
-            buf[0] = MCAM
-            buf[1] = MSG_ALIVE
-            buf[2:4] = (0).to_bytes(2, 'big')
-            for _ in range(12):
-                self.send_enc(buf)
-            self.emit('log', f"Sent {TYPE_DICT[MSG_ALIVE]}")
-
-        # Handle MSG_DRW
-        if p['type'] == MSG_DRW:
-            # Send MSG_DRW_ACK
-            buf = bytearray(10)
-            buf[0] = MCAM
-            buf[1] = MSG_DRW_ACK
-            buf[2:4] = (6).to_bytes(2, 'big')
-            buf[4] = 0xd1
-            buf[5] = p['channel']
-            buf[6:8] = (1).to_bytes(2, 'big')
-            buf[8:10] = p['index'].to_bytes(2, 'big')
-            self.send_enc(buf)
-
-            # Handle CMD Response
-            if p['channel'] == 0:
-                print('CMD Response received')
-                if p['data'].startswith(b'\x06\x0a'):
-                    data = p['data'][8:]
-                    _msg = data.decode('ascii')
-                    self.emit('cmd', _msg)
-
-            # Handle Video
-            if p['channel'] == 1:
-                # Handle MSG_DRW packet index overflow
-                if p['index'] > 65400:
-                    self.video_overflow = True
-
-                if self.video_overflow and p['index'] < 65400:
-                    self.last_video_frame = -1
-                    self.video_overflow = False
-                    self.video_boundaries.clear()
-                    self.video_received = []
-
-                if p['data'].startswith(b'\x55\xaa\x15\xa8\x03\x00'):
-                    self.video_received[p['index']] = p['data'][0x20:]
-                    self.video_boundaries.add(p['index'])
-                else:
-                    self.video_received[p['index']] = p['data']
-                self.get_video_frame()
-
-            # Handle audio
-            if p['channel'] == 2:
-                if self.last_audio_frame < p['index']:
-                    raw = p['data'][0x20:] if p['data'].startswith(b'\x55\xaa\x15\xa8\xaa\x01') else p['data']
-                    decoded = AdpcmDecoder.decode(raw)
-                    self.last_audio_frame = p['index']
-                    self.emit('audio_frame', {'frame': decoded, 'packet_index': p['index']})
-
-    def send_cmd_packet(self, msg):
+    def send_cmd_packet(self, msg): # replace with CommandMessage.to_buffer()
         if isinstance(msg, bytes):
             data = msg
         else:
@@ -224,10 +212,10 @@ class PPPP(EventEmitter):
         self.send_drw_packet(0, buf)
         print(f"CMD sent: {data.decode('ascii')}")
 
-    def send_drw_packet(self, channel, data):
+    def send_drw_packet(self, channel, data): # replace with DRWMessage.to_buffer()
         buf = bytearray(len(data) + 8)
         buf[0] = MCAM
-        buf[1] = MSG_DRW
+        buf[1] = MessageType.DRW
         buf[2:4] = (len(data) + 4).to_bytes(2, 'big')
         buf[4] = MDRW
         buf[5] = channel
@@ -237,34 +225,133 @@ class PPPP(EventEmitter):
         self.send_enc(buf)
         print(f'DRW packet sent (len: {len(buf)})')
 
-    # ... (rest of the methods)
-        
-
-
-    # ... (continuing from the previous Python code)
-
-    def parse_packet(self, buff):
-        try:
-            magic1 = buff[0]
-            packet_type = buff[1]
-            size = int.from_bytes(buff[2:4], byteorder='big')
-            magic2 = buff[4]
-            channel = buff[5]
-            index = int.from_bytes(buff[6:8], byteorder='big')
-            data = buff[8:]
-        except Exception as e:
-            print(f"Error parsing packet: {e}")
-            return None
-
-        return {
-            'magic1': magic1,
-            'type': packet_type,
-            'size': size,
-            'magic2': magic2,
-            'channel': channel,
-            'index': index,
-            'data': data,
+    def sendCommand(self, command, args):
+        fixed_data = {
+            'user': 'admin',
+            'pwd': '6666',
         }
+        data = {
+            'pro': CMD_DICT[command],
+            'cmd': command
+        }
+        strData = json.dumps({**data, **args, **fixed_data})
+        self.sendCMDPacket(strData)
+
+    def sendCMDCheckUser(self):
+        self.sendCommand(CommandType.CHECK_USER)
+
+    def sendCMDrequestVideo1(self):
+        self.logger.info('requesting 640x480 video stream')
+        self.sendCommand(CommandType.STREAM, {'video': 1})
+
+    def sendCMDrequestVideo2(self):
+        self.logger.info('requesting 320x240 video stream')
+        self.sendCommand(CommandType.STREAM, {'video': 2})
+
+    def sendCMDrequestAudio(self):
+        self.logger.info('requesting ADPCM audio stream')
+        self.sendCommand(CommandType.STREAM, {'audio': 1})
+
+    def sendCMDsetWifi(self, ssid, pw):
+        self.sendCommand(CommandType.SET_WIFI, {
+            'wifissid': ssid,
+            'encwifissid': ssid,
+            'wifipwd': pw,
+            'encwifipwd': pw,
+            'encryption': 1
+        })
+
+    def sendCMDscanWifi(self):
+        self.sendCommand(CommandType.SCAN_WIFI)
+
+    def sendCMDgetWifi(self):
+        self.sendCommand(CommandType.GET_WIFI)
+
+    def sendCMDgetRecordParam(self):
+        self.sendCommand(CommandType.GET_RECORD_PARAM)
+
+    def sendCMDgetParams(self):
+        self.sendCommand(CommandType.GET_PARMS)
+
+    def sendCMDIr(self, isOn):
+        self.sendCommand(CommandType.DEV_CONTROL, {'icut': 1 if isOn else 0})
+
+    def sendCMDLamp(self, isOn):
+        self.sendCommand(CommandType.DEV_CONTROL, {'lamp': 1 if isOn else 0})
+
+    def sendCMDTalkSend(self):
+        self.sendCommand(CommandType.TALK_SEND, {'isSend': 1})
+
+    def sendCMDGetWhiteLight(self):
+        self.sendCommand(CommandType.GET_WHITELIGHT)
+
+    def sendCMDSetWhiteLight(self, isOn):
+        self.sendCommand(CommandType.SET_WHITELIGHT, {'status': 1 if isOn else 0})
+
+    def sendCMDHeartBeat(self):
+        self.sendCommand(CommandType.DEV_CONTROL, {'heart': 1})
+
+    def sendCMDsetDateTime(self, my_timezone_offset, timestamp):
+        self.sendCommand(CommandType.SET_DATETIME, {
+            'tz': my_timezone_offset,
+            'time': timestamp,
+        })
+
+    def sendCMDsetPushServer(self):
+        self.sendCommand(CommandType.SET_CYPUSH, {
+            'pushIp': '192.168.7.20',
+            'pushPort': 5432,
+        })
+        unused_args = {
+            'pushInterval': 30,
+            'isPushVideo': 0,
+            'isPushPic': 0,
+            'cyAdmin': '<username>',
+            'cyPwd': '<password>',
+        }
+
+    def sendCMDsetAlarm(self):
+        self.sendCommand(CommandType.SET_ALARM, {
+            'pirPush': 1,
+            'pirenable': 1,
+            'pirsensitive': 2,
+            'pirDelayTime': 5,
+            'pirvideo': 0,
+            'pirvideotime': 0,
+        })
+
+    def sendCMDeditUser(self, userToEdit, newPwd, newUsername):
+        self.sendCommand(CommandType.EDIT_USER, {
+            'edituser': userToEdit,
+            'newpwd': newPwd,
+            'newuser': newUsername,
+        })
+
+    def sendCMDGetDeviceFirmwareInfo(self):
+        self.sendCommand(CommandType.GET_CLOUD_SUPPORT)
+
+    def sendCMDGetAlarm(self):
+        self.sendCommand(CommandType.GET_ALARM)
+
+    def sendCMDPtzControl(self, direction):
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 0, 'value': direction})
+
+    def sendCMDPtzStop(self):
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 0, 'value': PTZ.PAN_LEFT_STOP})
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 0, 'value': PTZ.PAN_RIGHT_STOP})
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 0, 'value': PTZ.TILT_DOWN_STOP})
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 0, 'value': PTZ.TILT_UP_STOP})
+
+    def sendCMDPtzReset(self):
+        self.sendCommand(CommandType.PTZ_CONTROL, {'parms': 1, 'value': 132})
+
+    def sendCMDReboot(self):
+        self.sendCommand(CommandType.DEV_CONTROL, {'reboot': 1})
+
+    def sendCMDReset(self):
+        self.sendCommand(CommandType.DEV_CONTROL, {'reset': 1})
+
+#endregion send
 
     def get_video_frame(self):
         if len(self.videoBoundaries) <= 1:
@@ -294,4 +381,8 @@ class PPPP(EventEmitter):
             for i in range(index):
                 self.videoReceived[i] = None
 
-    # ... (rest of the methods)
+    def destroy(self):
+        if self.isConnected:
+            buf = bytes([MCAM, MessageType.CLOSE, 0, 0])
+            for _ in range(3): self.sendEnc(buf)
+        self.socket.close()

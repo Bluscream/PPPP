@@ -60,6 +60,3 @@ def eh(m):
     print(p.hex())
     print(p.decode("ascii"))
     print("\n")
-
-# If you want to use this as a module, you can export the functions like this:
-# (In Python, functions are automatically available for import when the module is imported)
